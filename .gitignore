@@ -67,3 +67,9 @@ config.local.toml
 # Local tooling
 .ace-tool/
 .sisyphus/
+
+# Local workspace artifacts
+AGENTS.md
+app/AGENTS.md
+src/AGENTS.md
+docs/plans/
