@@ -6,7 +6,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate": "wrangler d1 migrations apply DB --remote",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:worker-reasoning": "bun test tests/worker_reasoning_model_strategy.test.mjs"
   },
   "dependencies": {
     "hono": "^4.6.16"
@@ -17,4 +18,3 @@
     "wrangler": "^4.61.0"
   }
 }
-

@@ -61,6 +61,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Install Bun
+        run: npm install -g bun
+
+      - name: Worker reasoning regression test
+        run: npm run test:worker-reasoning
+
       - name: Ensure D1 + KV and generate wrangler.ci.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
