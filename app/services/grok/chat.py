@@ -5,7 +5,7 @@ Grok Chat 服务
 import asyncio
 import uuid
 import orjson
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 
 from curl_cffi.requests import AsyncSession
@@ -37,8 +37,8 @@ class ChatRequest:
     """聊天请求数据"""
     model: str
     messages: List[Dict[str, Any]]
-    stream: bool = None
-    think: bool = None
+    stream: Optional[bool] = None
+    think: Optional[bool] = None
 
 
 class MessageExtractor:
@@ -193,9 +193,9 @@ class ChatRequestBuilder:
         message: str, 
         model: str, 
         mode: str, 
-        think: bool = None,
-        file_attachments: List[str] = None,
-        image_attachments: List[str] = None
+        think: Optional[bool] = None,
+        file_attachments: Optional[List[str]] = None,
+        image_attachments: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         构造请求体
@@ -236,7 +236,7 @@ class ChatRequestBuilder:
             "toolOverrides": {},
             "enableSideBySide": True,
             "sendFinalMetadata": True,
-            "isReasoning": False,
+            "isReasoning": bool(think),
             "disableTextFollowUps": False,
             "responseMetadata": {
                 "modelConfigOverride": {"modelMap": {}},
@@ -262,8 +262,8 @@ class ChatRequestBuilder:
 class GrokChatService:
     """Grok API 调用服务"""
     
-    def __init__(self, proxy: str = None):
-        self.proxy = proxy or get_config("grok.base_proxy_url", "")
+    def __init__(self, proxy: Optional[str] = None):
+        self.proxy: str = str(proxy or get_config("grok.base_proxy_url", "") or "")
     
     async def chat(
         self,
@@ -271,10 +271,10 @@ class GrokChatService:
         message: str,
         model: str = "grok-3",
         mode: str = "MODEL_MODE_FAST",
-        think: bool = None,
-        stream: bool = None,
-        file_attachments: List[str] = None,
-        image_attachments: List[str] = None
+        think: Optional[bool] = None,
+        stream: Optional[bool] = None,
+        file_attachments: Optional[List[str]] = None,
+        image_attachments: Optional[List[str]] = None
     ):
         """
         发送聊天请求
@@ -300,7 +300,7 @@ class GrokChatService:
             message, model, mode, think, 
             file_attachments, image_attachments
         )
-        proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+        proxies: Any = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         timeout = get_config("grok.timeout", TIMEOUT)
         
         # 状态码提取器
@@ -325,7 +325,7 @@ class GrokChatService:
                 
                 if response.status_code != 200:
                     try:
-                        content = await response.text()
+                        content = response.text
                         content = content[:1000] # 限制长度避免日志过大
                     except:
                         content = "Unable to read response content"
@@ -448,8 +448,8 @@ class ChatService:
     async def completions(
         model: str,
         messages: List[Dict[str, Any]],
-        stream: bool = None,
-        thinking: str = None
+        stream: Optional[bool] = None,
+        thinking: Optional[str] = None
     ):
         """
         Chat Completions 入口
@@ -532,7 +532,7 @@ class ChatService:
         
         # 处理响应
         if is_stream:
-            processor = StreamProcessor(model_name, token, think).process(response)
+            processor = StreamProcessor(model_name, token, bool(think)).process(response)
 
             async def _wrapped_stream():
                 completed = False
