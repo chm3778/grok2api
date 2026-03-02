@@ -23,7 +23,16 @@ function makeChunk(
   model: string,
   content: string,
   finish_reason?: "stop" | "error" | null,
+  reasoning_content?: string,
 ): string {
+  const delta: Record<string, unknown> = {};
+  if (content || reasoning_content) delta.role = "assistant";
+  if (content) delta.content = content;
+  if (typeof reasoning_content === "string" && reasoning_content) {
+    delta.reasoning_content = reasoning_content;
+    delta.reasoning = reasoning_content;
+  }
+
   const payload: Record<string, unknown> = {
     id,
     object: "chat.completion.chunk",
@@ -32,7 +41,7 @@ function makeChunk(
     choices: [
       {
         index: 0,
-        delta: content ? { role: "assistant", content } : {},
+        delta,
         finish_reason: finish_reason ?? null,
       },
     ],
@@ -112,6 +121,73 @@ function normalizeGeneratedAssetUrls(input: unknown): string[] {
   }
 
   return out;
+}
+
+function extractReasoningText(grok: any): string | undefined {
+  const directCandidates: unknown[] = [
+    grok?.reasoning_content,
+    grok?.reasoningContent,
+    grok?.reasoning,
+    grok?.thinking,
+  ];
+
+  for (const candidate of directCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+
+  const modelResp = grok?.modelResponse;
+  const modelCandidates: unknown[] = [
+    modelResp?.reasoning_content,
+    modelResp?.reasoningContent,
+    modelResp?.reasoning,
+    modelResp?.thinking,
+  ];
+  for (const candidate of modelCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+
+  return undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function nonEmptyText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function tokenMatchesFilteredTag(token: string, filteredTags: string[]): boolean {
+  if (!token) return false;
+  return filteredTags.some((tag) => tag && token.includes(tag));
+}
+
+function extractToolUsageReasoning(grok: any): string | undefined {
+  const card = asRecord(grok?.toolUsageCard);
+  if (!card) return undefined;
+
+  const rolloutId = nonEmptyText(grok?.rolloutId);
+  const prefix = rolloutId ? `[${rolloutId}] ` : "";
+
+  const webSearchArgs = asRecord(asRecord(card.webSearch)?.args);
+  const webSearchQuery = nonEmptyText(webSearchArgs?.query) ?? nonEmptyText(webSearchArgs?.q);
+  if (webSearchQuery) return `${prefix}[WebSearch] ${webSearchQuery}`;
+
+  const chatroomSendArgs = asRecord(asRecord(card.chatroomSend)?.args);
+  const chatroomMessage = nonEmptyText(chatroomSendArgs?.message);
+  if (chatroomMessage) return `${prefix}[AgentThink] ${chatroomMessage}`;
+
+  const searchImageArgs = asRecord(asRecord(card.searchImages)?.args);
+  const searchImageQuery =
+    nonEmptyText(searchImageArgs?.image_description) ??
+    nonEmptyText(searchImageArgs?.description) ??
+    nonEmptyText(searchImageArgs?.query);
+  if (searchImageQuery) return `${prefix}[SearchImage] ${searchImageQuery}`;
+
+  return undefined;
 }
 
 export function createOpenAiStreamFromGrokNdjson(
@@ -219,8 +295,7 @@ export function createOpenAiStreamFromGrokNdjson(
           if (!value) continue;
           buffer += decoder.decode(value, { stream: true });
 
-          let idx: number;
-          while ((idx = buffer.indexOf("\n")) !== -1) {
+          for (let idx = buffer.indexOf("\n"); idx !== -1; idx = buffer.indexOf("\n")) {
             const line = buffer.slice(0, idx).trim();
             buffer = buffer.slice(idx + 1);
             if (!line) continue;
@@ -306,6 +381,10 @@ export function createOpenAiStreamFromGrokNdjson(
 
             if (grok.imageAttachmentInfo) isImage = true;
             const rawToken = grok.token;
+            const explicitReasoningText = extractReasoningText(grok);
+            const toolUsageReasoningText = extractToolUsageReasoning(grok);
+            const currentIsThinking = Boolean(grok.isThinking);
+            const messageTag = grok.messageTag;
 
             if (isImage) {
               const modelResp = grok.modelResponse;
@@ -333,14 +412,16 @@ export function createOpenAiStreamFromGrokNdjson(
             }
 
             // Text chat stream
-            if (Array.isArray(rawToken)) continue;
-            if (typeof rawToken !== "string" || !rawToken) continue;
-            let token = rawToken;
+            const hasTextToken = typeof rawToken === "string" && rawToken.length > 0;
+            if (Array.isArray(rawToken) && !explicitReasoningText && !toolUsageReasoningText) continue;
+            if (!hasTextToken && !explicitReasoningText && !toolUsageReasoningText) continue;
+            let token = hasTextToken ? rawToken : "";
 
-            if (filteredTags.some((t) => token.includes(t))) continue;
-
-            const currentIsThinking = Boolean(grok.isThinking);
-            const messageTag = grok.messageTag;
+            const tokenFiltered = tokenMatchesFilteredTag(token, filteredTags);
+            if (tokenFiltered) {
+              if (!currentIsThinking) continue;
+              token = "";
+            }
 
             if (thinkingFinished && currentIsThinking) continue;
 
@@ -377,7 +458,14 @@ export function createOpenAiStreamFromGrokNdjson(
               shouldSkip = true;
             }
 
-            if (!shouldSkip) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+            const reasoningContent = showThinking
+              ? explicitReasoningText ?? toolUsageReasoningText ?? (currentIsThinking ? token : undefined)
+              : undefined;
+            if (!shouldSkip) {
+              controller.enqueue(
+                encoder.encode(makeChunk(id, created, currentModel, content, undefined, reasoningContent)),
+              );
+            }
             isThinking = currentIsThinking;
           }
         }
@@ -412,11 +500,17 @@ export async function parseOpenAiFromGrokNdjson(
   opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
+  const showThinking = settings.show_thinking !== false;
+  const filteredTags = (settings.filtered_tags ?? "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
   const text = await grokResp.text();
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
 
   let content = "";
   let model = requestedModel;
+  const reasoningParts: string[] = [];
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -430,6 +524,17 @@ export async function parseOpenAiFromGrokNdjson(
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
+
+    const currentIsThinking = Boolean(grok.isThinking);
+
+    const explicitReasoningText = extractReasoningText(grok);
+    const toolUsageReasoningText = extractToolUsageReasoning(grok);
+    const rawToken = typeof grok.token === "string" ? grok.token : "";
+    const tokenReasoningText = tokenMatchesFilteredTag(rawToken, filteredTags) ? "" : rawToken;
+    const frameReasoning = showThinking
+      ? explicitReasoningText ?? toolUsageReasoningText ?? (currentIsThinking ? tokenReasoningText : undefined)
+      : undefined;
+    if (frameReasoning) reasoningParts.push(frameReasoning);
 
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
@@ -476,6 +581,13 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
+  const reasoningText = reasoningParts.join("").trim();
+  const message: Record<string, unknown> = { role: "assistant", content };
+  if (showThinking && reasoningText) {
+    message.reasoning_content = reasoningText;
+    message.reasoning = reasoningText;
+  }
+
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
@@ -484,7 +596,7 @@ export async function parseOpenAiFromGrokNdjson(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
+        message,
         finish_reason: "stop",
       },
     ],

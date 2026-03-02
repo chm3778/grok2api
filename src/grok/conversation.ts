@@ -86,6 +86,10 @@ export function buildConversationPayload(args: {
   const cfg = getModelInfo(requestModel);
   const { grokModel, mode, isVideoModel } = toGrokModel(requestModel);
 
+  const responseMetadata: Record<string, unknown> = {
+    requestModelDetails: { modelId: grokModel },
+  };
+
   if (cfg?.is_video_model) {
     if (!postId) throw new Error("视频模型缺少 postId（需要先创建 media post）");
 
@@ -149,7 +153,7 @@ export function buildConversationPayload(args: {
       isReasoning: settings.show_thinking !== false,
       webpageUrls: [],
       disableTextFollowUps: true,
-      responseMetadata: { requestModelDetails: { modelId: grokModel } },
+      responseMetadata,
       disableMemory: false,
       forceSideBySide: false,
       modelMode: mode,
