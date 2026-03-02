@@ -166,6 +166,18 @@ function tokenMatchesFilteredTag(token: string, filteredTags: string[]): boolean
   return filteredTags.some((tag) => tag && token.includes(tag));
 }
 
+function splitGluedReasoningMarkers(value: string): string {
+  if (!value) return value;
+  return value.replace(
+    /([^\n])[ \t]*(?=\[(?:Agent\s*\d+|Grok)\]\s+\[(?:WebSearch|AgentThink|SearchImage)\])/g,
+    "$1\n\n",
+  );
+}
+
+function startsWithReasoningMarker(value: string): boolean {
+  return /^\s*\[(?:Agent\s*\d+|Grok)\]\s+\[(?:WebSearch|AgentThink|SearchImage)\]/.test(value);
+}
+
 function extractToolUsageReasoning(grok: any): string | undefined {
   const card = asRecord(grok?.toolUsageCard);
   if (!card) return undefined;
@@ -245,6 +257,7 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let lastVideoProgress = -1;
       let roleSent = false;
+      let hasEmittedReasoning = false;
 
       let buffer = "";
 
@@ -448,12 +461,23 @@ export function createOpenAiStreamFromGrokNdjson(
               shouldSkip = true;
             }
 
-            const reasoningContent = showThinking
+            let reasoningContent = showThinking
               ? explicitReasoningText ?? toolUsageReasoningText ?? (currentIsThinking ? token : undefined)
               : undefined;
+            if (typeof reasoningContent === "string" && reasoningContent) {
+              reasoningContent = splitGluedReasoningMarkers(reasoningContent);
+              if (
+                hasEmittedReasoning &&
+                startsWithReasoningMarker(reasoningContent) &&
+                !reasoningContent.startsWith("\n")
+              ) {
+                reasoningContent = `\n\n${reasoningContent}`;
+              }
+            }
             if (!content && !reasoningContent) shouldSkip = true;
             if (!shouldSkip) {
               emitChunk(content, undefined, reasoningContent);
+              if (reasoningContent) hasEmittedReasoning = true;
             }
             isThinking = currentIsThinking;
           }
@@ -566,7 +590,7 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
-  const reasoningText = reasoningParts.join("").trim();
+  const reasoningText = splitGluedReasoningMarkers(reasoningParts.join("").trim());
   const message: Record<string, unknown> = { role: "assistant", content };
   if (showThinking && reasoningText) {
     message.reasoning_content = reasoningText;

@@ -146,3 +146,53 @@ test('stream format emits role once and avoids think-tag wrappers when reasoning
   const roleMatches = sseText.match(/"role":"assistant"/g) ?? [];
   assert.equal(roleMatches.length, 1);
 });
+
+test('non-stream parser splits glued agent reasoning markers with blank lines', async () => {
+  const gluedReasoning =
+    '[Agent 3] [WebSearch] Jio SIM cost[Agent 3] [WebSearch] Jio eSIM activation[Agent 1] [AgentThink] summarize findings';
+  const lines = [
+    {
+      result: {
+        response: {
+          reasoning_content: gluedReasoning,
+          isThinking: true,
+        },
+      },
+    },
+    {
+      result: {
+        response: {
+          modelResponse: {
+            responseId: 'resp-2',
+            model: 'grok-420',
+            message: 'final',
+          },
+          isThinking: false,
+        },
+      },
+    },
+  ];
+
+  const parsed = await parseOpenAiFromGrokNdjson(new Response(lines.map((x) => JSON.stringify(x)).join('\n')), {
+    cookie: '',
+    settings: {
+      filtered_tags: 'xaiartifact,xai:tool_usage_card',
+      show_thinking: true,
+      video_poster_preview: false,
+    },
+    global: {
+      base_url: '',
+      log_level: 'INFO',
+    },
+    origin: 'http://127.0.0.1',
+    requestedModel: 'grok-4.20-beta',
+  });
+
+  const message = parsed.choices?.[0]?.message;
+  assert.ok(message && typeof message === 'object');
+  assert.equal(
+    message.reasoning_content,
+    '[Agent 3] [WebSearch] Jio SIM cost\n\n[Agent 3] [WebSearch] Jio eSIM activation\n\n[Agent 1] [AgentThink] summarize findings',
+  );
+  assert.equal(message.reasoning, message.reasoning_content);
+});
