@@ -24,9 +24,10 @@ function makeChunk(
   content: string,
   finish_reason?: "stop" | "error" | null,
   reasoning_content?: string,
+  includeRole = false,
 ): string {
   const delta: Record<string, unknown> = {};
-  if (content || reasoning_content) delta.role = "assistant";
+  if (includeRole) delta.role = "assistant";
   if (content) delta.content = content;
   if (typeof reasoning_content === "string" && reasoning_content) {
     delta.reasoning_content = reasoning_content;
@@ -242,13 +243,25 @@ export function createOpenAiStreamFromGrokNdjson(
       let isImage = false;
       let isThinking = false;
       let thinkingFinished = false;
-      let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let roleSent = false;
 
       let buffer = "";
 
+      const emitChunk = (
+        content: string,
+        finishReason?: "stop" | "error" | null,
+        reasoningContent?: string,
+      ) => {
+        const includeRole = !roleSent && (Boolean(content) || Boolean(reasoningContent));
+        controller.enqueue(
+          encoder.encode(makeChunk(id, created, currentModel, content, finishReason, reasoningContent, includeRole)),
+        );
+        if (includeRole) roleSent = true;
+      };
+
       const flushStop = () => {
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+        emitChunk("", "stop");
         controller.enqueue(encoder.encode(makeDone()));
       };
 
@@ -313,9 +326,7 @@ export function createOpenAiStreamFromGrokNdjson(
             const err = (data as any).error;
             if (err?.message) {
               finalStatus = 500;
-              controller.enqueue(
-                encoder.encode(makeChunk(id, created, currentModel, `Error: ${String(err.message)}`, "stop")),
-              );
+              emitChunk(`Error: ${String(err.message)}`, "stop");
               controller.enqueue(encoder.encode(makeDone()));
               if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
               controller.close();
@@ -338,16 +349,8 @@ export function createOpenAiStreamFromGrokNdjson(
               if (progress > lastVideoProgress) {
                 lastVideoProgress = progress;
                 if (showThinking) {
-                  let msg = "";
-                  if (!videoProgressStarted) {
-                    msg = `<think>视频已生成${progress}%\n`;
-                    videoProgressStarted = true;
-                  } else if (progress < 100) {
-                    msg = `视频已生成${progress}%\n`;
-                  } else {
-                    msg = `视频已生成${progress}%</think>\n`;
-                  }
-                  controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, msg)));
+                  const msg = `视频已生成${progress}%`;
+                  emitChunk("", undefined, msg);
                 }
               }
 
@@ -361,19 +364,12 @@ export function createOpenAiStreamFromGrokNdjson(
                   poster = toImgProxyUrl(global, origin, thumbPath);
                 }
 
-                controller.enqueue(
-                  encoder.encode(
-                    makeChunk(
-                      id,
-                      created,
-                      currentModel,
-                      buildVideoHtml({
-                        videoUrl: src,
-                        posterPreview: settings.video_poster_preview === true,
-                        ...(poster ? { posterUrl: poster } : {}),
-                      }),
-                    ),
-                  ),
+                emitChunk(
+                  buildVideoHtml({
+                    videoUrl: src,
+                    posterPreview: settings.video_poster_preview === true,
+                    ...(poster ? { posterUrl: poster } : {}),
+                  }),
                 );
               }
               continue;
@@ -397,16 +393,14 @@ export function createOpenAiStreamFromGrokNdjson(
                     const imgUrl = toImgProxyUrl(global, origin, imgPath);
                     linesOut.push(`![Generated Image](${imgUrl})`);
                   }
-                  controller.enqueue(
-                    encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"), "stop")),
-                  );
+                  emitChunk(linesOut.join("\n"), "stop");
                   controller.enqueue(encoder.encode(makeDone()));
                   if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
                   controller.close();
                   return;
                 }
               } else if (typeof rawToken === "string" && rawToken) {
-                controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, rawToken)));
+                emitChunk(rawToken);
               }
               continue;
             }
@@ -444,15 +438,11 @@ export function createOpenAiStreamFromGrokNdjson(
               }
             }
 
-            let content = token;
-            if (messageTag === "header") content = `\n\n${token}\n\n`;
+            let content = currentIsThinking ? "" : token;
+            if (!currentIsThinking && messageTag === "header") content = `\n\n${token}\n\n`;
 
             let shouldSkip = false;
-            if (!isThinking && currentIsThinking) {
-              if (showThinking) content = `<think>\n${content}`;
-              else shouldSkip = true;
-            } else if (isThinking && !currentIsThinking) {
-              if (showThinking) content = `\n</think>\n${content}`;
+            if (isThinking && !currentIsThinking) {
               thinkingFinished = true;
             } else if (currentIsThinking && !showThinking) {
               shouldSkip = true;
@@ -461,26 +451,21 @@ export function createOpenAiStreamFromGrokNdjson(
             const reasoningContent = showThinking
               ? explicitReasoningText ?? toolUsageReasoningText ?? (currentIsThinking ? token : undefined)
               : undefined;
+            if (!content && !reasoningContent) shouldSkip = true;
             if (!shouldSkip) {
-              controller.enqueue(
-                encoder.encode(makeChunk(id, created, currentModel, content, undefined, reasoningContent)),
-              );
+              emitChunk(content, undefined, reasoningContent);
             }
             isThinking = currentIsThinking;
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+        emitChunk("", "stop");
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
       } catch (e) {
         finalStatus = 500;
-        controller.enqueue(
-          encoder.encode(
-            makeChunk(id, created, currentModel, `处理错误: ${e instanceof Error ? e.message : String(e)}`, "error"),
-          ),
-        );
+        emitChunk(`处理错误: ${e instanceof Error ? e.message : String(e)}`, "error");
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
