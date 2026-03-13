@@ -70,6 +70,25 @@ export interface RegisterSettings {
   max_runtime_minutes?: number;
 }
 
+export interface ImageSettings {
+  blocked_parallel_enabled?: boolean;
+  blocked_parallel_attempts?: number;
+  final_min_bytes?: number;
+  medium_min_bytes?: number;
+  blocked_grace_seconds?: number;
+  final_timeout?: number;
+  stream_timeout?: number;
+  timeout?: number;
+  nsfw?: boolean;
+}
+
+export interface VideoSettings {
+  upscale_timing?: "single" | "complete";
+  concurrent?: number;
+  timeout?: number;
+  stream_timeout?: number;
+}
+
 export interface SettingsBundle {
   global: Required<GlobalSettings>;
   grok: Required<GrokSettings>;
@@ -77,6 +96,8 @@ export interface SettingsBundle {
   cache: Required<CacheSettings>;
   performance: Required<PerformanceSettings>;
   register: Required<RegisterSettings>;
+  image: Required<ImageSettings>;
+  video: Required<VideoSettings>;
 }
 
 const DEFAULTS: SettingsBundle = {
@@ -141,6 +162,23 @@ const DEFAULTS: SettingsBundle = {
     solver_debug: false,
     max_errors: 0,
     max_runtime_minutes: 0,
+  },
+  image: {
+    blocked_parallel_enabled: true,
+    blocked_parallel_attempts: 5,
+    final_min_bytes: 100000,
+    medium_min_bytes: 30000,
+    blocked_grace_seconds: 10,
+    final_timeout: 15,
+    stream_timeout: 60,
+    timeout: 60,
+    nsfw: true,
+  },
+  video: {
+    upscale_timing: "complete",
+    concurrent: 100,
+    timeout: 60,
+    stream_timeout: 60,
   },
 };
 
@@ -252,6 +290,8 @@ export async function getSettings(env: Env): Promise<SettingsBundle> {
     cache: { ...DEFAULTS.cache, ...cacheCfg },
     performance: { ...DEFAULTS.performance, ...performanceCfg },
     register: { ...DEFAULTS.register, ...registerCfg },
+    image: DEFAULTS.image,
+    video: DEFAULTS.video,
   };
 }
 
