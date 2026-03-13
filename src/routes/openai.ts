@@ -2006,4 +2006,259 @@ openAiRoutes.post("/uploads/image", async (c) => {
   }
 });
 
+openAiRoutes.post("/responses", async (c) => {
+  const start = Date.now();
+  const ip = getClientIp(c.req.raw);
+  const keyName = c.get("apiAuth").name ?? "Unknown";
+
+  const origin = new URL(c.req.url).origin;
+
+  let requestedModel = "";
+  try {
+    const body = (await c.req.json()) as {
+      model?: string;
+      input?: string | any[];
+      instructions?: string;
+      stream?: boolean;
+      reasoning?: { effort?: string };
+      temperature?: number;
+      top_p?: number;
+      tools?: any[];
+      tool_choice?: string | object;
+      parallel_tool_calls?: boolean;
+    };
+
+    requestedModel = String(body.model ?? "");
+    if (!requestedModel) return c.json(openAiError("Missing 'model'", "missing_model"), 400);
+    if (!isValidModel(requestedModel))
+      return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+
+    const settingsBundle = await getSettings(c.env);
+    const cfg = MODEL_CONFIG[requestedModel]!;
+
+    const stream = Boolean(body.stream);
+    const maxRetry = 3;
+    let lastErr: string | null = null;
+
+    // Quota check
+    const quotaKind = cfg.is_video_model ? "video" : cfg.is_image_model ? "image" : "chat";
+    const quota = await enforceQuota({
+      env: c.env,
+      apiAuth: c.get("apiAuth"),
+      model: requestedModel,
+      kind: quotaKind as any,
+      ...(cfg.is_image_model ? { imageCount: 2 } : {}),
+    });
+    if (!quota.ok) return quota.resp;
+
+    for (let attempt = 0; attempt < maxRetry; attempt++) {
+      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+
+      const jwt = chosen.token;
+      const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+      const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
+
+      try {
+        // Convert input to messages format
+        let messages: any[] = [];
+        if (typeof body.input === "string") {
+          messages = [{ role: "user", content: body.input }];
+        } else if (Array.isArray(body.input)) {
+          messages = body.input;
+        } else {
+          return c.json(openAiError("Missing or invalid 'input'", "missing_input"), 400);
+        }
+
+        // Add instructions as system message
+        if (body.instructions) {
+          messages.unshift({ role: "system", content: body.instructions });
+        }
+
+        const { content, images } = extractContent(messages);
+        const isVideoModel = Boolean(cfg.is_video_model);
+        const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
+
+        const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
+        const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
+        const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
+
+        let postId: string | undefined;
+        if (isVideoModel) {
+          if (imgUris.length) {
+            const post = await createPost(imgUris[0]!, cookie, settingsBundle.grok);
+            postId = post.postId || undefined;
+          } else {
+            const post = await createMediaPost(
+              { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: content },
+              cookie,
+              settingsBundle.grok,
+            );
+            postId = post.postId || undefined;
+          }
+        }
+
+        const { payload, referer } = buildConversationPayload({
+          requestModel: requestedModel,
+          content,
+          imgIds,
+          imgUris,
+          ...(postId ? { postId } : {}),
+          ...(isVideoModel ? { videoConfig: {} } : {}),
+          settings: settingsBundle.grok,
+        });
+
+        // Add reasoning effort if provided
+        if (body.reasoning?.effort && payload) {
+          (payload as any).reasoningEffort = body.reasoning.effort;
+        }
+
+        // Add tools if provided
+        if (body.tools && body.tools.length > 0 && payload) {
+          (payload as any).tools = body.tools;
+          if (body.tool_choice) {
+            (payload as any).toolChoice = body.tool_choice;
+          }
+          if (typeof body.parallel_tool_calls === "boolean") {
+            (payload as any).parallelToolCalls = body.parallel_tool_calls;
+          }
+        }
+
+        // Add temperature and top_p
+        if (typeof body.temperature === "number" && payload) {
+          (payload as any).temperature = body.temperature;
+        }
+        if (typeof body.top_p === "number" && payload) {
+          (payload as any).topP = body.top_p;
+        }
+
+        const upstream = await sendConversationRequest({
+          payload,
+          cookie,
+          settings: settingsBundle.grok,
+          ...(referer ? { referer } : {}),
+        });
+
+        if (!upstream.ok) {
+          const txt = await upstream.text().catch(() => "");
+          lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
+          await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+          await applyCooldown(c.env.DB, jwt, upstream.status);
+          if ([401, 429, 403].includes(upstream.status) && attempt < maxRetry - 1) continue;
+          break;
+        }
+
+        if (stream) {
+          const sse = createOpenAiStreamFromGrokNdjson(upstream, {
+            cookie,
+            settings: settingsBundle.grok,
+            global: settingsBundle.global,
+            origin,
+            requestedModel,
+            onFinish: async ({ status, duration }) => {
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(duration.toFixed(2)),
+                status,
+                key_name: keyName,
+                token_suffix: jwt.slice(-6),
+                error: status === 200 ? "" : "stream_error",
+              });
+            },
+          });
+
+          return new Response(sse, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        }
+
+        const json = await parseOpenAiFromGrokNdjson(upstream, {
+          cookie,
+          settings: settingsBundle.grok,
+          global: settingsBundle.global,
+          origin,
+          requestedModel,
+        }) as { choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>; usage?: unknown };
+
+        const responseId = `resp-${crypto.randomUUID()}`;
+        const created = Math.floor(Date.now() / 1000);
+        
+        const messageContent = json.choices?.[0]?.message?.content || "";
+        const reasoningContent = json.choices?.[0]?.message?.reasoning_content;
+        
+        const outputItem: Record<string, unknown> = {
+          type: "message",
+          role: "assistant",
+          content: messageContent,
+        };
+        
+        if (reasoningContent) {
+          outputItem.reasoning_content = reasoningContent;
+        }
+        
+        const responseBody = {
+          id: responseId,
+          object: "response",
+          created_at: created,
+          model: requestedModel,
+          output: [outputItem],
+          usage: json.usage || null,
+        };
+
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status: 200,
+          key_name: keyName,
+          token_suffix: jwt.slice(-6),
+          error: "",
+        });
+
+        return c.json(responseBody);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        lastErr = msg;
+        await recordTokenFailure(c.env.DB, jwt, 500, msg);
+        await applyCooldown(c.env.DB, jwt, 500);
+        if (attempt < maxRetry - 1) continue;
+      }
+    }
+
+    const duration = (Date.now() - start) / 1000;
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel,
+      duration: Number(duration.toFixed(2)),
+      status: 500,
+      key_name: keyName,
+      token_suffix: "",
+      error: lastErr ?? "unknown_error",
+    });
+
+    return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
+  } catch (e) {
+    const duration = (Date.now() - start) / 1000;
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel || "unknown",
+      duration: Number(duration.toFixed(2)),
+      status: 500,
+      key_name: keyName,
+      token_suffix: "",
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return c.json(openAiError("Internal error", "internal_error"), 500);
+  }
+});
+
 openAiRoutes.options("/*", (c) => c.body(null, 204));
